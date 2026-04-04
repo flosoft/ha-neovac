@@ -16,11 +16,13 @@ from homeassistant.helpers.update_coordinator import (
 
 from .api import NeoVacApiClient, NeoVacAuthError, NeoVacConnectionError
 from .const import (
+    CATEGORY_ELECTRICITY,
     CONF_SCAN_INTERVAL,
     CONF_USAGE_UNIT_ID,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     RESOLUTION_HOUR,
+    RESOLUTION_QUARTER_HOUR,
     SUPPORTED_CATEGORIES,
 )
 
@@ -31,14 +33,18 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator to fetch data from NeoVac MyEnergy API.
 
     The coordinator fetches consumption data for all available categories
-    for a single usage unit. The data is structured as:
+    for a single usage unit. Data is structured as:
 
     {
         "usage_unit": { ... usage unit metadata ... },
         "categories": {
-            "Electricity": { ... consumption data ... },
-            "Water": { ... consumption data ... },
-            ...
+            "Electricity": {
+                "measurementUnit": "KiloWattHours",
+                "invoicePeriods": [...],
+                "currentPeriodValues": [{date, value, isInterpolated}, ...],
+                "resolutions": [...],
+            },
+            "Water": { ... },
         },
         "available_categories": ["Electricity", "Water", ...],
     }
@@ -54,7 +60,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Initialize the coordinator."""
         self.client = client
-        self.unit_id: str = entry.data[CONF_USAGE_UNIT_ID]
+        self.unit_id: str = str(entry.data[CONF_USAGE_UNIT_ID])
         self._available_categories: list[str] | None = None
 
         scan_interval = entry.options.get(
@@ -71,11 +77,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from the NeoVac API.
-
-        Fetches consumption data for each available category using
-        hourly resolution for the last 24 hours.
-        """
+        """Fetch data from the NeoVac API."""
         try:
             return await self._fetch_all_data()
         except NeoVacAuthError as err:
@@ -99,7 +101,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "available_categories": [],
         }
 
-        # Get usage unit info (cached after first call)
+        # Get usage unit info
         try:
             unit_data = await self.client.get_usage_unit(self.unit_id)
             result["usage_unit"] = unit_data
@@ -119,7 +121,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         result["available_categories"] = self._available_categories
 
-        # Time window: last 24 hours with hourly resolution
+        # Time window: last 24 hours
         now = datetime.now()
         end_date = now.strftime("%Y-%m-%d %H:%M")
         start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
@@ -128,20 +130,28 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for category in self._available_categories:
             if category not in SUPPORTED_CATEGORIES:
                 continue
+
+            # Use finest resolution per category
+            resolution = (
+                RESOLUTION_QUARTER_HOUR
+                if category == CATEGORY_ELECTRICITY
+                else RESOLUTION_HOUR
+            )
+
             try:
                 data = await self.client.get_consumption(
                     self.unit_id,
                     category,
-                    resolution=RESOLUTION_HOUR,
+                    resolution=resolution,
                     start_date=start_date,
                     end_date=end_date,
                 )
                 if data is not None:
                     result["categories"][category] = data
                     _LOGGER.debug(
-                        "Got consumption data for %s: %s",
+                        "Got consumption data for %s: %d values",
                         category,
-                        type(data).__name__,
+                        len(data.get("currentPeriodValues", [])),
                     )
             except Exception as err:
                 _LOGGER.warning(

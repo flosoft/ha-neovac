@@ -2,11 +2,14 @@
 
 Provides sensors compatible with the Home Assistant Energy Dashboard:
 - Electricity consumption (kWh)
-- Water consumption (m³)
-- Warm water consumption (m³)
-- Cold water consumption (m³)
+- Water consumption (L) - total, warm, and cold
 - Heating consumption (kWh)
 - Cooling consumption (kWh)
+
+The NeoVac API returns per-interval consumption values (not cumulative).
+We sum the values in the current invoice period to create a monotonically
+increasing total that resets at the start of each invoice period, which is
+what SensorStateClass.TOTAL_INCREASING expects.
 """
 
 from __future__ import annotations
@@ -49,10 +52,11 @@ class NeoVacSensorEntityDescription(SensorEntityDescription):
     """Describes a NeoVac sensor entity."""
 
     category: str
-    value_key: str = "value"
 
 
-# Sensor descriptions for each energy category
+# Sensor descriptions for each energy category.
+# Water values come from the API in Liters; the invoice period sum is in m³.
+# We report the invoice period sum (m³) for the energy dashboard.
 SENSOR_DESCRIPTIONS: tuple[NeoVacSensorEntityDescription, ...] = (
     NeoVacSensorEntityDescription(
         key="electricity",
@@ -69,8 +73,8 @@ SENSOR_DESCRIPTIONS: tuple[NeoVacSensorEntityDescription, ...] = (
         category=CATEGORY_WATER,
         device_class=SensorDeviceClass.WATER,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-        suggested_display_precision=3,
+        native_unit_of_measurement=UnitOfVolume.LITERS,
+        suggested_display_precision=1,
     ),
     NeoVacSensorEntityDescription(
         key="warm_water",
@@ -78,8 +82,8 @@ SENSOR_DESCRIPTIONS: tuple[NeoVacSensorEntityDescription, ...] = (
         category=CATEGORY_WARM_WATER,
         device_class=SensorDeviceClass.WATER,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-        suggested_display_precision=3,
+        native_unit_of_measurement=UnitOfVolume.LITERS,
+        suggested_display_precision=1,
     ),
     NeoVacSensorEntityDescription(
         key="cold_water",
@@ -87,8 +91,8 @@ SENSOR_DESCRIPTIONS: tuple[NeoVacSensorEntityDescription, ...] = (
         category=CATEGORY_COLD_WATER,
         device_class=SensorDeviceClass.WATER,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-        suggested_display_precision=3,
+        native_unit_of_measurement=UnitOfVolume.LITERS,
+        suggested_display_precision=1,
     ),
     NeoVacSensorEntityDescription(
         key="heating",
@@ -150,74 +154,36 @@ async def async_setup_entry(
         )
 
 
-def _extract_latest_value(
-    category_data: dict[str, Any] | list | None,
-    value_key: str = "value",
+def _extract_period_total(
+    category_data: dict[str, Any] | None,
 ) -> float | None:
-    """Extract the latest consumption value from API response data.
+    """Extract the invoice period total from API response data.
 
-    The NeoVac API returns consumption data in various formats. This
-    function tries to extract the most recent total/cumulative value.
+    The NeoVac API response contains:
+    - invoicePeriods[].sum: cumulative total for the entire invoice period
+    - currentPeriodValues[]: individual interval readings
 
-    Common response structures:
-    - List of data points with timestamps and values
-    - Dict with a 'data' list of data points
-    - Dict with a direct 'value' or 'total' field
+    We use the invoice period sum as the sensor value because it's a
+    cumulative total that increases over the billing period and resets
+    when a new period starts -- exactly what TOTAL_INCREASING expects.
     """
-    if category_data is None:
+    if category_data is None or not isinstance(category_data, dict):
         return None
 
-    # If it's a dict, look for common patterns
-    if isinstance(category_data, dict):
-        # Direct value field
-        for key in ("total", "value", "currentValue", "cumulativeValue"):
-            if key in category_data:
-                val = category_data[key]
-                if isinstance(val, (int, float)):
-                    return float(val)
-
-        # Data points list inside the dict
-        data_points = category_data.get("data") or category_data.get(
-            "dataPoints"
-        ) or category_data.get("values") or category_data.get("items")
-
-        if isinstance(data_points, list) and data_points:
-            return _get_latest_from_points(data_points, value_key)
-
-        # Try to find any list value that looks like data points
-        for val in category_data.values():
-            if isinstance(val, list) and val:
-                result = _get_latest_from_points(val, value_key)
-                if result is not None:
-                    return result
-
-    # If it's a list directly
-    if isinstance(category_data, list) and category_data:
-        return _get_latest_from_points(category_data, value_key)
-
-    return None
-
-
-def _get_latest_from_points(
-    points: list, value_key: str = "value"
-) -> float | None:
-    """Get the latest value from a list of data points.
-
-    Data points are typically dicts with a timestamp and value field.
-    We want the last non-null value, which should be the most recent
-    cumulative reading.
-    """
-    # Iterate from the end to find the latest non-null value
-    for point in reversed(points):
-        if isinstance(point, dict):
-            # Try common value field names
-            for key in (value_key, "value", "total", "y", "consumption"):
-                if key in point:
-                    val = point[key]
-                    if val is not None and isinstance(val, (int, float)):
-                        return float(val)
-        elif isinstance(point, (int, float)):
-            return float(point)
+    # Use the invoice period sum as the cumulative total
+    invoice_periods = category_data.get("invoicePeriods")
+    if isinstance(invoice_periods, list) and invoice_periods:
+        # Use the most recent (last) period
+        period = invoice_periods[-1]
+        total = period.get("sum")
+        if total is not None and isinstance(total, (int, float)):
+            # Convert water from m³ to Liters if the sum is in CubicMeter
+            # but the measurement unit is Liter
+            measurement_unit = category_data.get("measurementUnit", "")
+            sum_unit = period.get("sumUnit", "")
+            if measurement_unit == "Liter" and sum_unit == "CubicMeter":
+                return float(total) * 1000.0
+            return float(total)
 
     return None
 
@@ -239,11 +205,11 @@ class NeoVacSensor(CoordinatorEntity[NeoVacCoordinator], SensorEntity):
         self.entity_description = description
 
         unit_id = entry.data[CONF_USAGE_UNIT_ID]
-        unit_name = entry.data.get(CONF_USAGE_UNIT_NAME, unit_id)
+        unit_name = entry.data.get(CONF_USAGE_UNIT_NAME, str(unit_id))
 
         self._attr_unique_id = f"{unit_id}_{description.key}"
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, unit_id)},
+            identifiers={(DOMAIN, str(unit_id))},
             name=f"NeoVac {unit_name}",
             manufacturer="NeoVac",
             model="MyEnergy",
@@ -251,7 +217,10 @@ class NeoVacSensor(CoordinatorEntity[NeoVacCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Return the current sensor value."""
+        """Return the current sensor value.
+
+        Returns the invoice period cumulative total.
+        """
         if not self.coordinator.data:
             return None
 
@@ -261,9 +230,7 @@ class NeoVacSensor(CoordinatorEntity[NeoVacCoordinator], SensorEntity):
         if category_data is None:
             return None
 
-        value = _extract_latest_value(
-            category_data, self.entity_description.value_key
-        )
+        value = _extract_period_total(category_data)
 
         if value is not None:
             _LOGGER.debug(
@@ -274,6 +241,54 @@ class NeoVacSensor(CoordinatorEntity[NeoVacCoordinator], SensorEntity):
             )
 
         return value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return additional state attributes."""
+        if not self.coordinator.data:
+            return None
+
+        categories = self.coordinator.data.get("categories", {})
+        category_data = categories.get(self.entity_description.category)
+
+        if not isinstance(category_data, dict):
+            return None
+
+        attrs: dict[str, Any] = {}
+
+        # Add measurement unit info
+        measurement_unit = category_data.get("measurementUnit")
+        if measurement_unit:
+            attrs["api_measurement_unit"] = measurement_unit
+
+        # Add available resolutions
+        resolutions = category_data.get("resolutions")
+        if resolutions:
+            attrs["available_resolutions"] = resolutions
+
+        # Add the latest interval value (most recent reading)
+        current_values = category_data.get("currentPeriodValues")
+        if isinstance(current_values, list) and current_values:
+            # Find last non-interpolated value, or just the last value
+            latest = current_values[-1]
+            for point in reversed(current_values):
+                if not point.get("isInterpolated", False):
+                    latest = point
+                    break
+            attrs["latest_reading"] = latest.get("value")
+            attrs["latest_reading_date"] = latest.get("date")
+            attrs["latest_reading_interpolated"] = latest.get(
+                "isInterpolated", False
+            )
+
+        # Add invoice period info
+        invoice_periods = category_data.get("invoicePeriods")
+        if isinstance(invoice_periods, list) and invoice_periods:
+            period = invoice_periods[-1]
+            attrs["invoice_period_start"] = period.get("startDate")
+            attrs["invoice_period_end"] = period.get("endDate")
+
+        return attrs if attrs else None
 
     @property
     def available(self) -> bool:

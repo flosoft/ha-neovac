@@ -13,8 +13,10 @@ AUTH_LOGIN_URL = f"{AUTH_API_URL}/Account/Login"
 AUTH_LOGOUT_URL = f"{AUTH_API_URL}/Account/Logout"
 AUTH_IS_AUTHENTICATED_URL = f"{AUTH_API_URL}/Account/IsAuthenticated"
 
+# OIDC endpoints (myenergy.neovac.ch)
+MYENERGY_CHALLENGE_URL = f"{MYENERGY_BASE_URL}/connect/challenge"
+
 # MyEnergy API endpoints (myenergy.neovac.ch)
-MYENERGY_AUTH_URL = f"{MYENERGY_API_URL}/account/authenticate"
 MYENERGY_ENVIRONMENT_URL = f"{MYENERGY_API_URL}/environment"
 MYENERGY_USAGE_UNITS_URL = f"{MYENERGY_API_URL}/usageunits"
 
@@ -30,10 +32,11 @@ DEFAULT_SCAN_INTERVAL = 15  # minutes
 MIN_SCAN_INTERVAL = 5  # minutes
 MAX_SCAN_INTERVAL = 60  # minutes
 
-# Energy categories from the NeoVac API
+# Energy categories - these are the exact API values used in URL paths
+# e.g. /consumption/Electricity, /consumption/WaterWarm
 CATEGORY_ELECTRICITY = "Electricity"
 CATEGORY_HEATING = "Heating"
-CATEGORY_WARM_WATER = "WarmWater"
+CATEGORY_WARM_WATER = "WaterWarm"
 CATEGORY_WATER = "Water"
 CATEGORY_COLD_WATER = "WaterCold"
 CATEGORY_COOLING = "Cooling"
@@ -42,9 +45,12 @@ CATEGORY_CHARGING_STATION = "ChargingStation"
 CATEGORY_ZEV = "Zev"
 
 # Resolution values for the consumption endpoint
-RESOLUTION_HOUR = "Hour"
-RESOLUTION_MONTH = "Month"
-RESOLUTION_YEAR = "Year"
+# The API uses adverb-style strings: Hourly, Daily, Monthly, Yearly, QuarterHourly
+RESOLUTION_QUARTER_HOUR = "QuarterHourly"
+RESOLUTION_HOUR = "Hourly"
+RESOLUTION_DAY = "Daily"
+RESOLUTION_MONTH = "Monthly"
+RESOLUTION_YEAR = "Yearly"
 
 # Categories we create sensors for
 SUPPORTED_CATEGORIES = [

@@ -3,6 +3,12 @@
 
 Tests authentication and data fetching without requiring Home Assistant.
 
+Authentication flow (reverse-engineered from the Angular frontend):
+1. POST /connect/challenge (no prompt, or prompt=none) to get the OIDC authorize URL
+2. POST to auth.neovac.ch/api/v1/Account/Login with the OIDC authorize path as redirectUrl
+3. Follow the redirect chain: authorize -> signin-oidc -> session cookie set
+4. Use cookie-based auth for all API calls
+
 Usage:
     python tests/test_api.py --email user@example.com --password secret
     python tests/test_api.py  # reads from NEOVAC_EMAIL and NEOVAC_PASSWORD env vars
@@ -25,21 +31,31 @@ import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlencode, urlparse, parse_qs
 
 import aiohttp
 
-# Allow importing from the custom_components directory
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Import constants directly from const.py to avoid loading the HA-dependent
+# __init__.py of the custom_components.neovac package.
+import importlib.util
 
-from custom_components.neovac.const import (
-    AUTH_IS_AUTHENTICATED_URL,
-    AUTH_LOGIN_URL,
-    MYENERGY_AUTH_URL,
-    MYENERGY_API_URL,
-    MYENERGY_USAGE_UNITS_URL,
-    RESOLUTION_HOUR,
-    SUPPORTED_CATEGORIES,
-)
+_const_path = Path(__file__).parent.parent / "custom_components" / "neovac" / "const.py"
+_spec = importlib.util.spec_from_file_location("neovac_const", _const_path)
+_const = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_const)
+
+AUTH_BASE_URL = _const.AUTH_BASE_URL
+AUTH_IS_AUTHENTICATED_URL = _const.AUTH_IS_AUTHENTICATED_URL
+AUTH_LOGIN_URL = _const.AUTH_LOGIN_URL
+MYENERGY_BASE_URL = _const.MYENERGY_BASE_URL
+MYENERGY_API_URL = _const.MYENERGY_API_URL
+MYENERGY_CHALLENGE_URL = _const.MYENERGY_CHALLENGE_URL
+MYENERGY_USAGE_UNITS_URL = _const.MYENERGY_USAGE_UNITS_URL
+RESOLUTION_HOUR = _const.RESOLUTION_HOUR
+SUPPORTED_CATEGORIES = _const.SUPPORTED_CATEGORIES
+
+# Derived
+MYENERGY_ENVIRONMENT_URL = f"{MYENERGY_API_URL}/environment"
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -68,328 +84,307 @@ def dump_to_file(filename: str, data: object) -> None:
     print(f"  -> Dumped to {path}")
 
 
-async def test_auth_portal(
+def print_cookies(jar: aiohttp.CookieJar) -> None:
+    """Print all cookies in the jar."""
+    count = 0
+    for cookie in jar:
+        count += 1
+        val = cookie.value
+        if len(val) > 40:
+            val = val[:20] + "..." + val[-8:]
+        domain = cookie.get("domain", "N/A")
+        print(f"    {cookie.key} = {val}  (domain: {domain})")
+    if count == 0:
+        print("    (none)")
+
+
+async def authenticate(
     session: aiohttp.ClientSession,
     email: str,
     password: str,
     dump_raw: bool = False,
-) -> dict:
-    """Test authentication via auth.neovac.ch portal."""
-    log = logging.getLogger("auth_portal")
+) -> bool:
+    """Authenticate and establish a session for myenergy.neovac.ch.
 
-    result = {
-        "success": False,
-        "login_status": None,
-        "login_response": None,
-        "is_authenticated": None,
-        "cookies": {},
-    }
+    Returns True if authentication succeeded (cookie-based session established).
 
-    # Step 1: Login
-    log.info("POST %s", AUTH_LOGIN_URL)
-    payload = {"email": email, "password": password}
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    Flow:
+    1. Trigger OIDC challenge on myenergy to get the authorize URL
+    2. Login to auth.neovac.ch with the OIDC authorize path as redirectUrl
+    3. Follow the redirect chain to complete the OIDC code exchange
+    """
+    log = logging.getLogger("auth")
 
-    async with session.post(
-        AUTH_LOGIN_URL, json=payload, headers=headers
-    ) as resp:
-        result["login_status"] = resp.status
-        log.info("  Status: %s", resp.status)
-        log.info("  Headers: %s", dict(resp.headers))
+    # ── Step 1: Trigger OIDC challenge to get the authorize URL ──
+    # We use prompt=none here because we haven't logged in yet -- we just
+    # want to get the authorize URL structure. The challenge always returns
+    # 401 with Location regardless of auth state.
+    log.info("Step 1: Trigger OIDC challenge to get authorize URL")
+    challenge_url = f"{MYENERGY_CHALLENGE_URL}?prompt=login"
+    log.info("POST %s", challenge_url)
 
-        try:
-            data = await resp.json()
-            result["login_response"] = data
-            if dump_raw:
-                dump_to_file("auth_login", data)
-        except Exception:
-            text = await resp.text()
-            result["login_response"] = text
-            log.info("  Body (text): %s", text[:500])
-
-        if resp.status in (200, 204):
-            result["success"] = True
-            log.info("  Auth portal login succeeded!")
-        else:
-            log.error("  Auth portal login FAILED")
-
-    # Capture cookies
-    for cookie in session.cookie_jar:
-        result["cookies"][cookie.key] = {
-            "value": cookie.value[:20] + "..." if len(cookie.value) > 20 else cookie.value,
-            "domain": cookie.get("domain", ""),
-            "path": cookie.get("path", ""),
-            "secure": cookie.get("secure", ""),
-        }
-
-    if result["cookies"]:
-        log.info("  Cookies received: %s", list(result["cookies"].keys()))
-    else:
-        log.warning("  No cookies received!")
-
-    # Step 2: Check IsAuthenticated
-    log.info("GET %s", AUTH_IS_AUTHENTICATED_URL)
+    authorize_url = None
     try:
-        async with session.get(
-            AUTH_IS_AUTHENTICATED_URL,
-            headers={"Accept": "application/json"},
+        async with session.post(
+            challenge_url,
+            allow_redirects=False,
+            headers={
+                "Accept": "application/json, text/html",
+                "Origin": MYENERGY_BASE_URL,
+                "Referer": f"{MYENERGY_BASE_URL}/",
+            },
         ) as resp:
-            result["is_authenticated_status"] = resp.status
             log.info("  Status: %s", resp.status)
-            try:
-                data = await resp.json()
-                result["is_authenticated"] = data
-                log.info("  Response: %s", data)
-                if dump_raw:
-                    dump_to_file("auth_is_authenticated", data)
-            except Exception:
-                text = await resp.text()
-                result["is_authenticated"] = text
-                log.info("  Body (text): %s", text[:500])
-    except Exception as err:
-        log.error("  IsAuthenticated error: %s", err)
+            authorize_url = resp.headers.get("Location")
+            if authorize_url:
+                log.info("  Got authorize URL: %s", authorize_url[:100] + "...")
+            else:
+                log.error("  No Location header in challenge response")
+                return False
+    except aiohttp.ClientError as err:
+        log.error("  Challenge error: %s", err)
+        return False
 
-    return result
+    # ── Step 2: Login to auth.neovac.ch ──────────────────────────
+    # The authorize URL points to auth.neovac.ch/connect/authorize?...
+    # When we hit it unauthenticated, it redirects to the login page.
+    # Instead, we first login via the API, then hit the authorize URL.
+    log.info("Step 2: Login to auth portal")
+    log.info("POST %s", AUTH_LOGIN_URL)
 
+    # Extract the path from the authorize URL to use as redirectUrl
+    parsed_auth = urlparse(authorize_url)
+    # The redirectUrl for the login API should be the path+query of the authorize URL
+    authorize_path = parsed_auth.path
+    if parsed_auth.query:
+        authorize_path += "?" + parsed_auth.query
 
-async def test_myenergy_auth(
-    session: aiohttp.ClientSession,
-    email: str,
-    password: str,
-    dump_raw: bool = False,
-) -> str | None:
-    """Test direct authentication to myenergy API."""
-    log = logging.getLogger("myenergy_auth")
-
-    log.info("POST %s", MYENERGY_AUTH_URL)
-    payload = {"email": email, "password": password}
+    payload = {
+        "username": email,
+        "password": password,
+        "redirectUrl": authorize_path,
+    }
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "Origin": AUTH_BASE_URL,
+        "Referer": f"{AUTH_BASE_URL}/",
     }
 
     try:
         async with session.post(
-            MYENERGY_AUTH_URL, json=payload, headers=headers
+            AUTH_LOGIN_URL, json=payload, headers=headers,
+            allow_redirects=False,
         ) as resp:
             log.info("  Status: %s", resp.status)
-            log.info("  Headers: %s", dict(resp.headers))
+            log.debug("  Response headers: %s", dict(resp.headers))
 
+            body = None
             try:
-                data = await resp.json()
-                log.info("  Response type: %s", type(data).__name__)
-                if dump_raw:
-                    dump_to_file("myenergy_auth", data)
-
-                if resp.status == 200:
-                    if isinstance(data, dict):
-                        token = (
-                            data.get("sessionToken")
-                            or data.get("token")
-                            or data.get("accessToken")
-                        )
-                        if token:
-                            log.info(
-                                "  Got token: %s...%s",
-                                token[:8],
-                                token[-4:] if len(token) > 12 else "",
-                            )
-                            return token
-                        log.info("  Response keys: %s", list(data.keys()))
-                    elif isinstance(data, str) and len(data) > 10:
-                        log.info("  Got string token: %s...", data[:8])
-                        return data
-                    log.info("  Full response: %s", data)
-                else:
-                    log.warning("  Auth failed: %s", data)
+                body = await resp.json()
             except Exception:
-                text = await resp.text()
-                log.info("  Body (text): %s", text[:500])
-                if resp.status == 200 and len(text) > 10:
-                    return text
+                body = await resp.text()
+
+            if dump_raw:
+                dump_to_file("01_auth_login", body)
+
+            if resp.status not in (200, 204, 301, 302):
+                log.error("  Auth portal login FAILED: %s", body)
+                return False
+
+            log.info("  Auth portal login OK")
+            log.info("  Response: %s", body)
+
+            # The response should contain a redirectUrl pointing to the
+            # authorize endpoint (same path we sent)
+            redirect_url = None
+            if isinstance(body, dict):
+                redirect_url = body.get("redirectUrl")
 
     except aiohttp.ClientError as err:
         log.error("  Connection error: %s", err)
+        return False
 
-    return None
+    log.info("  Cookies after login:")
+    print_cookies(session.cookie_jar)
 
+    # ── Step 3: Follow the OIDC authorize flow ───────────────────
+    # Now we're authenticated at auth.neovac.ch (have cookies).
+    # Hit the authorize URL -- it should auto-complete and redirect
+    # us back to myenergy.neovac.ch/signin-oidc with a code.
+    log.info("Step 3: Follow OIDC authorize flow")
 
-async def test_usage_units(
-    session: aiohttp.ClientSession,
-    token: str,
-    dump_raw: bool = False,
-) -> list[dict]:
-    """Fetch and display usage units."""
-    log = logging.getLogger("usage_units")
+    # Build full authorize URL (either from login response or original)
+    if redirect_url and redirect_url != "/":
+        # The login response gave us the path back
+        if redirect_url.startswith("/"):
+            next_url = f"{AUTH_BASE_URL}{redirect_url}"
+        else:
+            next_url = redirect_url
+    else:
+        next_url = authorize_url
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
+    log.info("  Following: %s", next_url[:120] + "..." if len(next_url) > 120 else next_url)
 
-    log.info("GET %s", MYENERGY_USAGE_UNITS_URL)
-    async with session.get(
-        MYENERGY_USAGE_UNITS_URL, headers=headers
-    ) as resp:
-        log.info("  Status: %s", resp.status)
-        if resp.status != 200:
-            text = await resp.text()
-            log.error("  Failed: %s", text[:500])
-            return []
+    # Follow the redirect chain manually so we can log each step
+    success = await _follow_redirect_chain(session, next_url, dump_raw, log)
 
-        data = await resp.json()
-        if dump_raw:
-            dump_to_file("usage_units", data)
+    log.info("  Cookies after OIDC flow:")
+    print_cookies(session.cookie_jar)
 
-        units = data if isinstance(data, list) else [data]
-        print_json("Usage Units", units)
-        return units
+    if not success:
+        # ── Fallback: Try using prompt=none ──────────────────────
+        log.info("Step 3 (fallback): Try challenge with prompt=none")
+        challenge_url_none = f"{MYENERGY_CHALLENGE_URL}?prompt=none"
+        try:
+            async with session.post(
+                challenge_url_none,
+                allow_redirects=False,
+                headers={
+                    "Accept": "application/json, text/html",
+                    "Origin": MYENERGY_BASE_URL,
+                },
+            ) as resp:
+                log.info("  Status: %s", resp.status)
+                location = resp.headers.get("Location")
+                if location:
+                    log.info("  Location: %s", location[:120])
+                    success = await _follow_redirect_chain(session, location, dump_raw, log)
+        except Exception as err:
+            log.warning("  Fallback challenge error: %s", err)
 
-
-async def test_consumption(
-    session: aiohttp.ClientSession,
-    token: str,
-    unit_id: str,
-    category: str,
-    dump_raw: bool = False,
-) -> dict | None:
-    """Fetch consumption data for a specific category."""
-    log = logging.getLogger("consumption")
-
-    now = datetime.now()
-    end_date = now.strftime("%Y-%m-%d %H:%M")
-    start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
-
-    url = f"{MYENERGY_USAGE_UNITS_URL}/{unit_id}/consumption/{category}"
-    params = {
-        "resolution": RESOLUTION_HOUR,
-        "startdate": start_date,
-        "enddate": end_date,
-    }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-    log.info("GET %s (params: %s)", url, params)
+    # ── Step 4: Test API access ──────────────────────────────────
+    log.info("Step 4: Test cookie-based API access")
     try:
-        async with session.get(url, params=params, headers=headers) as resp:
+        async with session.get(
+            MYENERGY_USAGE_UNITS_URL,
+            headers={"Accept": "application/json"},
+        ) as resp:
+            log.info("  GET %s -> %s", MYENERGY_USAGE_UNITS_URL, resp.status)
+            if resp.status == 200:
+                log.info("  Cookie-based API access works!")
+                return True
+            else:
+                text = await resp.text()
+                log.info("  API returned %s: %s", resp.status, text[:300])
+    except Exception as err:
+        log.warning("  API test error: %s", err)
+
+    return False
+
+
+async def _follow_redirect_chain(
+    session: aiohttp.ClientSession,
+    url: str,
+    dump_raw: bool,
+    log: logging.Logger,
+    max_redirects: int = 15,
+) -> bool:
+    """Follow a redirect chain manually, logging each step.
+
+    Returns True if we end up with a successful (non-auth) page.
+    """
+    for i in range(max_redirects):
+        log.info("  Redirect %d: GET %s", i + 1, url[:120] + ("..." if len(url) > 120 else ""))
+        try:
+            async with session.get(
+                url,
+                allow_redirects=False,
+                headers={"Accept": "text/html,application/json"},
+            ) as resp:
+                log.info("    Status: %s", resp.status)
+
+                location = resp.headers.get("Location")
+
+                if resp.status in (301, 302, 303, 307, 308):
+                    if location:
+                        # Resolve relative URLs
+                        if location.startswith("/"):
+                            parsed_current = urlparse(url)
+                            location = f"{parsed_current.scheme}://{parsed_current.netloc}{location}"
+                        log.info("    -> %s", location[:120] + ("..." if len(location) > 120 else ""))
+                        url = location
+                        continue
+                    else:
+                        log.warning("    Redirect with no Location header")
+                        return False
+
+                if resp.status == 200:
+                    # Check final URL - if we're on myenergy, we might be done
+                    final_url = str(resp.url)
+                    log.info("    Final URL: %s", final_url)
+
+                    # If we landed on the login page, auth didn't auto-complete
+                    if "/auth/login" in final_url:
+                        log.warning("    Landed on login page - OIDC did not auto-complete")
+                        if dump_raw:
+                            try:
+                                body = await resp.text()
+                                dump_to_file(f"redirect_{i+1}_login_page", {"url": final_url, "body": body[:2000]})
+                            except Exception:
+                                pass
+                        return False
+
+                    # If we're on myenergy.neovac.ch (not the auth portal), we're done
+                    if "myenergy.neovac.ch" in final_url:
+                        log.info("    Landed on myenergy - OIDC flow complete!")
+                        return True
+
+                    log.info("    Landed on: %s", final_url)
+                    if dump_raw:
+                        try:
+                            body = await resp.text()
+                            dump_to_file(f"redirect_{i+1}_final", {"url": final_url, "status": resp.status, "body": body[:2000]})
+                        except Exception:
+                            pass
+                    return False
+
+                if resp.status == 401:
+                    if location:
+                        log.info("    401 with Location, following...")
+                        if location.startswith("/"):
+                            parsed_current = urlparse(url)
+                            location = f"{parsed_current.scheme}://{parsed_current.netloc}{location}"
+                        url = location
+                        continue
+                    else:
+                        log.warning("    401 with no Location")
+                        return False
+
+                log.warning("    Unexpected status: %s", resp.status)
+                return False
+
+        except Exception as err:
+            log.warning("    Redirect error: %s", err)
+            return False
+
+    log.warning("    Too many redirects")
+    return False
+
+
+async def fetch_data(
+    session: aiohttp.ClientSession,
+    url: str,
+    label: str,
+    dump_raw: bool = False,
+    dump_name: str | None = None,
+) -> dict | list | None:
+    """Fetch JSON data from a URL using the session cookies."""
+    log = logging.getLogger(label)
+    headers = {"Accept": "application/json"}
+
+    log.info("GET %s", url)
+    try:
+        async with session.get(url, headers=headers) as resp:
             log.info("  Status: %s", resp.status)
             if resp.status == 200:
                 data = await resp.json()
-                if dump_raw:
-                    dump_to_file(f"consumption_{category}", data)
+                if dump_raw and dump_name:
+                    dump_to_file(dump_name, data)
                 return data
             elif resp.status == 404:
-                log.info("  Category %s not available for this unit", category)
+                log.info("  Not found")
                 return None
-            else:
-                text = await resp.text()
-                log.warning("  Unexpected response: %s", text[:500])
-                return None
-    except Exception as err:
-        log.error("  Error: %s", err)
-        return None
-
-
-async def test_comparison(
-    session: aiohttp.ClientSession,
-    token: str,
-    unit_id: str,
-    dump_raw: bool = False,
-) -> dict | None:
-    """Fetch comparison/overview data."""
-    log = logging.getLogger("comparison")
-
-    now = datetime.now()
-    end_date = now.strftime("%Y-%m-%d %H:%M")
-    start_date = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
-
-    url = f"{MYENERGY_USAGE_UNITS_URL}/{unit_id}/compare"
-    params = {"startdate": start_date, "enddate": end_date}
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-    log.info("GET %s", url)
-    try:
-        async with session.get(url, params=params, headers=headers) as resp:
-            log.info("  Status: %s", resp.status)
-            if resp.status == 200:
-                data = await resp.json()
-                if dump_raw:
-                    dump_to_file("comparison", data)
-                return data
-            else:
-                text = await resp.text()
-                log.warning("  Failed: %s", text[:500])
-                return None
-    except Exception as err:
-        log.error("  Error: %s", err)
-        return None
-
-
-async def test_comparison_settings(
-    session: aiohttp.ClientSession,
-    token: str,
-    unit_id: str,
-    dump_raw: bool = False,
-) -> dict | list | None:
-    """Fetch comparison settings (available categories)."""
-    log = logging.getLogger("comparison_settings")
-
-    url = f"{MYENERGY_USAGE_UNITS_URL}/{unit_id}/comparisonsettings"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-    log.info("GET %s", url)
-    try:
-        async with session.get(url, headers=headers) as resp:
-            log.info("  Status: %s", resp.status)
-            if resp.status == 200:
-                data = await resp.json()
-                if dump_raw:
-                    dump_to_file("comparison_settings", data)
-                return data
-            else:
-                text = await resp.text()
-                log.warning("  Failed: %s", text[:500])
-                return None
-    except Exception as err:
-        log.error("  Error: %s", err)
-        return None
-
-
-async def test_invoice_periods(
-    session: aiohttp.ClientSession,
-    token: str,
-    unit_id: str,
-    dump_raw: bool = False,
-) -> list | None:
-    """Fetch invoice periods."""
-    log = logging.getLogger("invoice_periods")
-
-    url = f"{MYENERGY_USAGE_UNITS_URL}/{unit_id}/invoiceperiod"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-    log.info("GET %s", url)
-    try:
-        async with session.get(url, headers=headers) as resp:
-            log.info("  Status: %s", resp.status)
-            if resp.status == 200:
-                data = await resp.json()
-                if dump_raw:
-                    dump_to_file("invoice_periods", data)
-                return data
             else:
                 text = await resp.text()
                 log.warning("  Failed: %s", text[:500])
@@ -444,8 +439,8 @@ async def main() -> None:
     print(f"Time:  {datetime.now().isoformat()}")
     print()
 
-    # Use a shared cookie jar so auth portal cookies carry over
-    jar = aiohttp.CookieJar()
+    # Use a cookie jar that handles cross-domain cookies
+    jar = aiohttp.CookieJar(unsafe=True)
     async with aiohttp.ClientSession(cookie_jar=jar) as session:
 
         # ── Phase 1: Authentication ──────────────────────────────
@@ -453,64 +448,42 @@ async def main() -> None:
         print("  PHASE 1: Authentication")
         print("─" * 60)
 
-        token = None
+        ok = await authenticate(session, args.email, args.password, args.dump_raw)
 
-        # Try direct myenergy auth first
-        log.info("Trying direct myenergy authentication...")
-        token = await test_myenergy_auth(
-            session, args.email, args.password, args.dump_raw
-        )
-
-        if not token:
-            # Try auth portal flow
-            log.info("Trying auth portal flow...")
-            portal_result = await test_auth_portal(
-                session, args.email, args.password, args.dump_raw
-            )
-
-            if portal_result["success"]:
-                # Check if login response contained a token
-                resp = portal_result.get("login_response")
-                if isinstance(resp, dict):
-                    token = (
-                        resp.get("sessionToken")
-                        or resp.get("token")
-                        or resp.get("accessToken")
-                    )
-
-                if not token:
-                    # Try myenergy auth again with cookies from portal
-                    log.info("Retrying myenergy auth with portal cookies...")
-                    token = await test_myenergy_auth(
-                        session, args.email, args.password, args.dump_raw
-                    )
-
-        if not token:
+        if not ok:
             print("\n*** AUTHENTICATION FAILED ***")
-            print("Could not obtain a Bearer token.")
-            print("\nDebug info:")
-            print(f"  Cookies in jar: {len(jar)}")
-            for cookie in jar:
-                print(f"    {cookie.key} = {cookie.value[:30]}... (domain: {cookie.get('domain', 'N/A')})")
+            print("Could not establish an authenticated session.")
+            print("\nCookies in jar:")
+            print_cookies(jar)
             sys.exit(1)
 
-        print(f"\n  Token obtained: {token[:12]}...{token[-4:]}")
-        print(f"  Token length: {len(token)}")
+        print("\n  Authentication: OK (cookie-based)")
 
         # ── Phase 2: Fetch Usage Units ───────────────────────────
         print("\n" + "─" * 60)
         print("  PHASE 2: Usage Units")
         print("─" * 60)
 
-        units = await test_usage_units(session, token, args.dump_raw)
+        units_data = await fetch_data(
+            session, MYENERGY_USAGE_UNITS_URL,
+            "usage_units", args.dump_raw, "usage_units",
+        )
+        units = []
+        if isinstance(units_data, list):
+            units = units_data
+        elif isinstance(units_data, dict):
+            units = [units_data]
+
         if not units:
             print("\n*** No usage units found ***")
+            print_json("Raw response", units_data)
             sys.exit(1)
+
+        print_json("Usage Units", units)
 
         # Select unit to test
         unit_id = args.unit_id
         if not unit_id:
-            # Use the first unit
             unit = units[0]
             unit_id = str(
                 unit.get("usageUnitId")
@@ -525,8 +498,10 @@ async def main() -> None:
         print("  PHASE 3: Invoice Periods")
         print("─" * 60)
 
-        periods = await test_invoice_periods(
-            session, token, unit_id, args.dump_raw
+        periods = await fetch_data(
+            session,
+            f"{MYENERGY_USAGE_UNITS_URL}/{unit_id}/invoiceperiod",
+            "invoice_periods", args.dump_raw, "invoice_periods",
         )
         if periods:
             print_json("Invoice Periods", periods)
@@ -536,8 +511,10 @@ async def main() -> None:
         print("  PHASE 4: Comparison Settings (Available Categories)")
         print("─" * 60)
 
-        settings = await test_comparison_settings(
-            session, token, unit_id, args.dump_raw
+        settings = await fetch_data(
+            session,
+            f"{MYENERGY_USAGE_UNITS_URL}/{unit_id}/comparisonsettings",
+            "comparison_settings", args.dump_raw, "comparison_settings",
         )
         if settings:
             print_json("Comparison Settings", settings)
@@ -547,8 +524,15 @@ async def main() -> None:
         print("  PHASE 5: Comparison Overview")
         print("─" * 60)
 
-        comparison = await test_comparison(
-            session, token, unit_id, args.dump_raw
+        now = datetime.now()
+        end_date = now.strftime("%Y-%m-%d %H:%M")
+        start_30d = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
+        start_1d = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
+
+        comparison = await fetch_data(
+            session,
+            f"{MYENERGY_USAGE_UNITS_URL}/{unit_id}/compare?startdate={start_30d}&enddate={end_date}",
+            "comparison", args.dump_raw, "comparison",
         )
         if comparison:
             print_json("Comparison Data", comparison)
@@ -561,8 +545,14 @@ async def main() -> None:
         available_categories = []
         for category in SUPPORTED_CATEGORIES:
             print(f"\n  Testing category: {category}")
-            data = await test_consumption(
-                session, token, unit_id, category, args.dump_raw
+            url = (
+                f"{MYENERGY_USAGE_UNITS_URL}/{unit_id}/consumption/{category}"
+                f"?resolution={RESOLUTION_HOUR}"
+                f"&startdate={start_1d}&enddate={end_date}"
+            )
+            data = await fetch_data(
+                session, url, "consumption",
+                args.dump_raw, f"consumption_{category}",
             )
             if data is not None:
                 available_categories.append(category)
@@ -572,13 +562,13 @@ async def main() -> None:
         print("\n" + "=" * 60)
         print("  SUMMARY")
         print("=" * 60)
-        print(f"  Authentication: OK")
+        print(f"  Authentication: OK (cookie-based)")
         print(f"  Usage units found: {len(units)}")
         for unit in units:
             uid = unit.get("usageUnitId") or unit.get("id")
             name = unit.get("customName") or unit.get("name") or "unnamed"
             print(f"    - {name} (ID: {uid})")
-        print(f"  Invoice periods: {len(periods) if periods else 0}")
+        print(f"  Invoice periods: {len(periods) if isinstance(periods, list) else 'N/A'}")
         print(f"  Available categories: {available_categories}")
         print(f"  Categories tested: {len(SUPPORTED_CATEGORIES)}")
         print(f"  Categories with data: {len(available_categories)}")
