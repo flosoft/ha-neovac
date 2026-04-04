@@ -51,7 +51,9 @@ MYENERGY_BASE_URL = _const.MYENERGY_BASE_URL
 MYENERGY_API_URL = _const.MYENERGY_API_URL
 MYENERGY_CHALLENGE_URL = _const.MYENERGY_CHALLENGE_URL
 MYENERGY_USAGE_UNITS_URL = _const.MYENERGY_USAGE_UNITS_URL
+CATEGORY_ELECTRICITY = _const.CATEGORY_ELECTRICITY
 RESOLUTION_HOUR = _const.RESOLUTION_HOUR
+RESOLUTION_QUARTER_HOUR = _const.RESOLUTION_QUARTER_HOUR
 SUPPORTED_CATEGORIES = _const.SUPPORTED_CATEGORIES
 
 # Derived
@@ -544,10 +546,16 @@ async def main() -> None:
 
         available_categories = []
         for category in SUPPORTED_CATEGORIES:
-            print(f"\n  Testing category: {category}")
+            # Use QuarterHourly for Electricity, Hourly for everything else
+            resolution = (
+                RESOLUTION_QUARTER_HOUR
+                if category == CATEGORY_ELECTRICITY
+                else RESOLUTION_HOUR
+            )
+            print(f"\n  Testing category: {category} (resolution: {resolution})")
             url = (
                 f"{MYENERGY_USAGE_UNITS_URL}/{unit_id}/consumption/{category}"
-                f"?resolution={RESOLUTION_HOUR}"
+                f"?resolution={resolution}"
                 f"&startdate={start_1d}&enddate={end_date}"
             )
             data = await fetch_data(
