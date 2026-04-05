@@ -31,6 +31,7 @@ from .api import (
     NeoVacConnectionError,
 )
 from .const import (
+    CONF_DEBUG_LOGGING,
     CONF_EMAIL,
     CONF_PASSWORD,
     CONF_SCAN_INTERVAL,
@@ -265,6 +266,10 @@ class NeoVacOptionsFlow(OptionsFlow):
             ),
         )
 
+        current_debug_logging = self.config_entry.options.get(
+            CONF_DEBUG_LOGGING, False
+        )
+
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
@@ -278,6 +283,10 @@ class NeoVacOptionsFlow(OptionsFlow):
                             min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL
                         ),
                     ),
+                    vol.Optional(
+                        CONF_DEBUG_LOGGING,
+                        default=current_debug_logging,
+                    ): bool,
                 }
             ),
         )

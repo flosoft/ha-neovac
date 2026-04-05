@@ -161,6 +161,8 @@ async def async_setup_entry(
 def _extract_period_total(
     category_data: dict[str, Any] | None,
     last_sum_changed: str | None = None,
+    category: str | None = None,
+    debug_logging: bool = False,
 ) -> float | None:
     """Extract the invoice period total, adjusted with recent interval values.
 
@@ -176,17 +178,36 @@ def _extract_period_total(
     invoice period sum.  Every time the backend updates the invoice sum the
     sensor re-anchors, avoiding drift.
     """
+    label = category or "unknown"
+
     if category_data is None or not isinstance(category_data, dict):
+        if debug_logging:
+            _LOGGER.info(
+                "[NeoVac debug] %s: no category data available, returning None",
+                label,
+            )
         return None
 
     # --- base value: invoice period sum ---
     invoice_periods = category_data.get("invoicePeriods")
     if not isinstance(invoice_periods, list) or not invoice_periods:
+        if debug_logging:
+            _LOGGER.info(
+                "[NeoVac debug] %s: no invoice periods in data, returning None",
+                label,
+            )
         return None
 
     period = invoice_periods[-1]
     total = period.get("sum")
     if total is None or not isinstance(total, (int, float)):
+        if debug_logging:
+            _LOGGER.info(
+                "[NeoVac debug] %s: invoice period sum is missing or invalid "
+                "(value=%r), returning None",
+                label,
+                total,
+            )
         return None
 
     base_value = float(total)
@@ -199,27 +220,51 @@ def _extract_period_total(
     )
 
     if needs_water_conversion:
+        if debug_logging:
+            _LOGGER.info(
+                "[NeoVac debug] %s: converting water unit m3 -> L: "
+                "%.4f m3 -> %.1f L",
+                label,
+                base_value,
+                base_value * 1000.0,
+            )
         base_value *= 1000.0
 
     # --- fine-grained adjustment from currentPeriodValues ---
     if last_sum_changed is None:
         # No anchor timestamp available (first poll) — return base only.
+        if debug_logging:
+            _LOGGER.info(
+                "[NeoVac debug] %s: no anchor timestamp (first poll), "
+                "returning base value only: %.4f",
+                label,
+                base_value,
+            )
         return base_value
 
     current_values = category_data.get("currentPeriodValues")
     if not isinstance(current_values, list) or not current_values:
+        if debug_logging:
+            _LOGGER.info(
+                "[NeoVac debug] %s: no currentPeriodValues, "
+                "returning base value only: %.4f",
+                label,
+                base_value,
+            )
         return base_value
 
     # Sum interval values whose date is strictly after the anchor timestamp.
     # Both timestamps are naive-local ISO strings so lexicographic comparison
     # works correctly.
     adjustment = 0.0
+    adjustment_count = 0
     for point in current_values:
         point_date = point.get("date", "")
         if point_date > last_sum_changed:
             val = point.get("value")
             if isinstance(val, (int, float)):
                 adjustment += val
+                adjustment_count += 1
 
     if adjustment > 0:
         _LOGGER.debug(
@@ -228,9 +273,20 @@ def _extract_period_total(
             base_value,
             adjustment,
             last_sum_changed,
-            sum(
-                1 for p in current_values if p.get("date", "") > last_sum_changed
-            ),
+            adjustment_count,
+        )
+
+    if debug_logging:
+        _LOGGER.info(
+            "[NeoVac debug] %s: base=%.4f + adjustment=%.6f "
+            "(%d of %d interval values after anchor %s) = %.4f",
+            label,
+            base_value,
+            adjustment,
+            adjustment_count,
+            len(current_values),
+            last_sum_changed,
+            base_value + adjustment,
         )
 
     return base_value + adjustment
@@ -287,7 +343,12 @@ class NeoVacSensor(CoordinatorEntity[NeoVacCoordinator], SensorEntity):
             )
         )
 
-        value = _extract_period_total(category_data, last_sum_changed)
+        value = _extract_period_total(
+            category_data,
+            last_sum_changed,
+            category=self.entity_description.category,
+            debug_logging=self.coordinator.debug_logging,
+        )
 
         if value is not None:
             _LOGGER.debug(

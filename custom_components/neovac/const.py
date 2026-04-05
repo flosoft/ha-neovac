@@ -26,6 +26,7 @@ CONF_PASSWORD = "password"
 CONF_USAGE_UNIT_ID = "usage_unit_id"
 CONF_USAGE_UNIT_NAME = "usage_unit_name"
 CONF_SCAN_INTERVAL = "scan_interval"
+CONF_DEBUG_LOGGING = "debug_logging"
 
 # Defaults
 DEFAULT_SCAN_INTERVAL = 15  # minutes

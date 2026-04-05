@@ -17,6 +17,7 @@ from homeassistant.helpers.update_coordinator import (
 from .api import NeoVacApiClient, NeoVacAuthError, NeoVacConnectionError
 from .const import (
     CATEGORY_ELECTRICITY,
+    CONF_DEBUG_LOGGING,
     CONF_SCAN_INTERVAL,
     CONF_USAGE_UNIT_ID,
     DEFAULT_SCAN_INTERVAL,
@@ -70,6 +71,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.client = client
         self.unit_id: str = str(entry.data[CONF_USAGE_UNIT_ID])
         self._available_categories: list[str] | None = None
+        self.debug_logging: bool = entry.options.get(CONF_DEBUG_LOGGING, False)
 
         # Track when invoicePeriods[-1].sum last changed per category.
         # Stored as naive-local ISO timestamps (matching currentPeriodValues
@@ -92,6 +94,8 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the NeoVac API."""
+        if self.debug_logging:
+            _LOGGER.info("[NeoVac debug] Starting data update for unit %s", self.unit_id)
         try:
             return await self._fetch_all_data()
         except NeoVacAuthError as err:
@@ -148,6 +152,12 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.unit_id,
                 self._available_categories,
             )
+            if self.debug_logging:
+                _LOGGER.info(
+                    "[NeoVac debug] Discovered %d categories: %s",
+                    len(self._available_categories),
+                    ", ".join(self._available_categories),
+                )
 
         result["available_categories"] = self._available_categories
 
@@ -211,6 +221,18 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             len(data.get("currentPeriodValues", [])),
                             self._last_sum_changed[category],
                         )
+                        if self.debug_logging:
+                            _LOGGER.info(
+                                "[NeoVac debug] %s: invoice period sum "
+                                "CHANGED %.4f -> %.4f | "
+                                "received %d interval values | "
+                                "new anchor timestamp: %s",
+                                category,
+                                old_total if old_total is not None else 0,
+                                new_total if new_total is not None else 0,
+                                len(data.get("currentPeriodValues", [])),
+                                self._last_sum_changed[category],
+                            )
                     else:
                         # Sum unchanged. Keep the previous invoice period
                         # data but update currentPeriodValues so sensors
@@ -227,6 +249,17 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             new_total,
                             len(data.get("currentPeriodValues", [])),
                         )
+                        if self.debug_logging:
+                            _LOGGER.info(
+                                "[NeoVac debug] %s: invoice period sum "
+                                "UNCHANGED at %.4f | "
+                                "updated %d interval values | "
+                                "anchor timestamp: %s",
+                                category,
+                                new_total,
+                                len(data.get("currentPeriodValues", [])),
+                                self._last_sum_changed.get(category, "N/A"),
+                            )
             except Exception as err:
                 _LOGGER.warning(
                     "Failed to fetch consumption for %s: %s",

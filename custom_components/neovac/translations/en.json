@@ -40,9 +40,13 @@
     "step": {
       "init": {
         "title": "NeoVac MyEnergy Options",
-        "description": "Configure polling interval for data updates.",
+        "description": "Configure polling interval and diagnostics.",
         "data": {
-          "scan_interval": "Update interval (minutes)"
+          "scan_interval": "Update interval (minutes)",
+          "debug_logging": "Enable debug logging"
+        },
+        "data_description": {
+          "debug_logging": "Log detailed information about fetched values and computation decisions to the Home Assistant log."
         }
       }
     }
