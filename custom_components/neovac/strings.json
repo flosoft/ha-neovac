@@ -40,12 +40,15 @@
     "step": {
       "init": {
         "title": "NeoVac MyEnergy Options",
-        "description": "Configure polling interval and diagnostics.",
+        "description": "Configure polling intervals and diagnostics.",
         "data": {
-          "scan_interval": "Update interval (minutes)",
+          "scan_interval_electricity": "Electricity update interval (minutes)",
+          "scan_interval_other": "Water / heating / cooling update interval (minutes)",
           "debug_logging": "Enable debug logging"
         },
         "data_description": {
+          "scan_interval_electricity": "How often to fetch electricity consumption data. Electricity meters update in 15-minute intervals.",
+          "scan_interval_other": "How often to fetch water, heating, and cooling consumption data. These meters typically update hourly.",
           "debug_logging": "Log detailed information about fetched values and computation decisions to the Home Assistant log."
         }
       }

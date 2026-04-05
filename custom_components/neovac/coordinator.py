@@ -19,8 +19,11 @@ from .const import (
     CATEGORY_ELECTRICITY,
     CONF_DEBUG_LOGGING,
     CONF_SCAN_INTERVAL,
+    CONF_SCAN_INTERVAL_ELECTRICITY,
+    CONF_SCAN_INTERVAL_OTHER,
     CONF_USAGE_UNIT_ID,
-    DEFAULT_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL_ELECTRICITY,
+    DEFAULT_SCAN_INTERVAL_OTHER,
     DOMAIN,
     RESOLUTION_HOUR,
     RESOLUTION_QUARTER_HOUR,
@@ -73,16 +76,41 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Stored as naive-local ISO timestamps for debugging visibility.
         self._last_sum_changed: dict[str, str] = {}
 
-        scan_interval = entry.options.get(
+        # Per-type scan intervals.  Migrate from legacy single interval.
+        legacy_interval = entry.options.get(
             CONF_SCAN_INTERVAL,
-            entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+            entry.data.get(CONF_SCAN_INTERVAL),
         )
 
+        self._electricity_interval = timedelta(
+            minutes=entry.options.get(
+                CONF_SCAN_INTERVAL_ELECTRICITY,
+                entry.data.get(
+                    CONF_SCAN_INTERVAL_ELECTRICITY,
+                    legacy_interval or DEFAULT_SCAN_INTERVAL_ELECTRICITY,
+                ),
+            )
+        )
+        self._other_interval = timedelta(
+            minutes=entry.options.get(
+                CONF_SCAN_INTERVAL_OTHER,
+                entry.data.get(
+                    CONF_SCAN_INTERVAL_OTHER,
+                    DEFAULT_SCAN_INTERVAL_OTHER,
+                ),
+            )
+        )
+
+        # Track the last time non-electricity categories were fetched
+        # so we can skip them when their interval hasn't elapsed yet.
+        self._last_other_fetch: datetime | None = None
+
+        # The coordinator ticks at the fastest (electricity) interval.
         super().__init__(
             hass,
             _LOGGER,
             name=f"{DOMAIN}_{self.unit_id}",
-            update_interval=timedelta(minutes=scan_interval),
+            update_interval=self._electricity_interval,
             config_entry=entry,
         )
 
@@ -165,15 +193,56 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         end_date = now.strftime("%Y-%m-%d %H:%M")
         start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
 
+        # Determine whether non-electricity categories should be fetched
+        # this cycle.  They run on a slower interval.
+        fetch_other = (
+            self._last_other_fetch is None
+            or (now - self._last_other_fetch) >= self._other_interval
+        )
+
+        # Build the list of categories that will actually be fetched.
+        categories_to_fetch = [
+            cat for cat in self._available_categories
+            if cat in SUPPORTED_CATEGORIES
+            and (cat == CATEGORY_ELECTRICITY or fetch_other)
+        ]
+        categories_skipped = [
+            cat for cat in self._available_categories
+            if cat in SUPPORTED_CATEGORIES
+            and cat != CATEGORY_ELECTRICITY
+            and not fetch_other
+        ]
+
+        if self.debug_logging:
+            _LOGGER.warning(
+                "[NeoVac debug] fetch_other=%s  "
+                "(last_other_fetch=%s, other_interval=%s) | "
+                "fetching: [%s] | skipping: [%s]",
+                fetch_other,
+                self._last_other_fetch,
+                self._other_interval,
+                ", ".join(categories_to_fetch),
+                ", ".join(categories_skipped),
+            )
+
         # Fetch consumption for each available category
         for category in self._available_categories:
             if category not in SUPPORTED_CATEGORIES:
                 continue
 
+            is_electricity = category == CATEGORY_ELECTRICITY
+
+            # Skip non-electricity categories when their interval
+            # hasn't elapsed yet — carry forward previous data.
+            if not is_electricity and not fetch_other:
+                if category in previous_categories:
+                    result["categories"][category] = previous_categories[category]
+                continue
+
             # Use finest resolution per category
             resolution = (
                 RESOLUTION_QUARTER_HOUR
-                if category == CATEGORY_ELECTRICITY
+                if is_electricity
                 else RESOLUTION_HOUR
             )
 
@@ -254,6 +323,10 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     category,
                     err,
                 )
+
+        # Record when non-electricity categories were last fetched
+        if fetch_other:
+            self._last_other_fetch = now
 
         # Expose the sum-changed timestamps so sensors can access them.
         result["last_sum_changed"] = dict(self._last_sum_changed)

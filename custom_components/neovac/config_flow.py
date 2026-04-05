@@ -35,9 +35,12 @@ from .const import (
     CONF_EMAIL,
     CONF_PASSWORD,
     CONF_SCAN_INTERVAL,
+    CONF_SCAN_INTERVAL_ELECTRICITY,
+    CONF_SCAN_INTERVAL_OTHER,
     CONF_USAGE_UNIT_ID,
     CONF_USAGE_UNIT_NAME,
-    DEFAULT_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL_ELECTRICITY,
+    DEFAULT_SCAN_INTERVAL_OTHER,
     DOMAIN,
     MAX_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
@@ -183,7 +186,8 @@ class NeoVacConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_PASSWORD: self._password,
                 CONF_USAGE_UNIT_ID: unit_id,
                 CONF_USAGE_UNIT_NAME: unit_name,
-                CONF_SCAN_INTERVAL: DEFAULT_SCAN_INTERVAL,
+                CONF_SCAN_INTERVAL_ELECTRICITY: DEFAULT_SCAN_INTERVAL_ELECTRICITY,
+                CONF_SCAN_INTERVAL_OTHER: DEFAULT_SCAN_INTERVAL_OTHER,
             },
         )
 
@@ -259,10 +263,25 @@ class NeoVacOptionsFlow(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current_interval = self.config_entry.options.get(
+        # Migrate from legacy single scan_interval
+        legacy_interval = self.config_entry.options.get(
             CONF_SCAN_INTERVAL,
+            self.config_entry.data.get(CONF_SCAN_INTERVAL),
+        )
+
+        current_electricity_interval = self.config_entry.options.get(
+            CONF_SCAN_INTERVAL_ELECTRICITY,
             self.config_entry.data.get(
-                CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+                CONF_SCAN_INTERVAL_ELECTRICITY,
+                legacy_interval or DEFAULT_SCAN_INTERVAL_ELECTRICITY,
+            ),
+        )
+
+        current_other_interval = self.config_entry.options.get(
+            CONF_SCAN_INTERVAL_OTHER,
+            self.config_entry.data.get(
+                CONF_SCAN_INTERVAL_OTHER,
+                DEFAULT_SCAN_INTERVAL_OTHER,
             ),
         )
 
@@ -275,8 +294,17 @@ class NeoVacOptionsFlow(OptionsFlow):
             data_schema=vol.Schema(
                 {
                     vol.Required(
-                        CONF_SCAN_INTERVAL,
-                        default=current_interval,
+                        CONF_SCAN_INTERVAL_ELECTRICITY,
+                        default=current_electricity_interval,
+                    ): vol.All(
+                        vol.Coerce(int),
+                        vol.Range(
+                            min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL
+                        ),
+                    ),
+                    vol.Required(
+                        CONF_SCAN_INTERVAL_OTHER,
+                        default=current_other_interval,
                     ): vol.All(
                         vol.Coerce(int),
                         vol.Range(

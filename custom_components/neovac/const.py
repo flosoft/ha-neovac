@@ -25,13 +25,17 @@ CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_USAGE_UNIT_ID = "usage_unit_id"
 CONF_USAGE_UNIT_NAME = "usage_unit_name"
-CONF_SCAN_INTERVAL = "scan_interval"
+CONF_SCAN_INTERVAL = "scan_interval"  # legacy, kept for migration
+CONF_SCAN_INTERVAL_ELECTRICITY = "scan_interval_electricity"
+CONF_SCAN_INTERVAL_OTHER = "scan_interval_other"
 CONF_DEBUG_LOGGING = "debug_logging"
 
 # Defaults
-DEFAULT_SCAN_INTERVAL = 15  # minutes
+DEFAULT_SCAN_INTERVAL = 15  # minutes (legacy)
+DEFAULT_SCAN_INTERVAL_ELECTRICITY = 15  # minutes
+DEFAULT_SCAN_INTERVAL_OTHER = 180  # minutes (3 hours)
 MIN_SCAN_INTERVAL = 5  # minutes
-MAX_SCAN_INTERVAL = 60  # minutes
+MAX_SCAN_INTERVAL = 1440  # minutes (24 hours)
 
 # Energy categories - these are the exact API values used in URL paths
 # e.g. /consumption/Electricity, /consumption/WaterWarm
