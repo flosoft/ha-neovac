@@ -6,10 +6,14 @@ Provides sensors compatible with the Home Assistant Energy Dashboard:
 - Heating consumption (kWh)
 - Cooling consumption (kWh)
 
-The NeoVac API returns per-interval consumption values (not cumulative).
-We sum the values in the current invoice period to create a monotonically
-increasing total that resets at the start of each invoice period, which is
-what SensorStateClass.TOTAL_INCREASING expects.
+The NeoVac API returns:
+- invoicePeriods[-1].sum: a cumulative total that updates infrequently
+- currentPeriodValues[]: fine-grained per-interval readings
+
+We use the invoice period sum as the ground-truth anchor and add recent
+interval values on top to provide higher-resolution data.  Every time the
+backend publishes a new invoice period sum the sensor re-anchors, which
+keeps the value consistent with TOTAL_INCREASING semantics.
 """
 
 from __future__ import annotations
@@ -156,36 +160,80 @@ async def async_setup_entry(
 
 def _extract_period_total(
     category_data: dict[str, Any] | None,
+    last_sum_changed: str | None = None,
 ) -> float | None:
-    """Extract the invoice period total from API response data.
+    """Extract the invoice period total, adjusted with recent interval values.
 
     The NeoVac API response contains:
     - invoicePeriods[].sum: cumulative total for the entire invoice period
-    - currentPeriodValues[]: individual interval readings
+      (updates infrequently)
+    - currentPeriodValues[]: individual interval readings with timestamps
+      (updates every poll)
 
-    We use the invoice period sum as the sensor value because it's a
-    cumulative total that increases over the billing period and resets
-    when a new period starts -- exactly what TOTAL_INCREASING expects.
+    To provide finer-grained data we take invoicePeriods[-1].sum as the
+    ground-truth anchor and add on top the sum of currentPeriodValues whose
+    timestamp is strictly after the moment we last observed a change in the
+    invoice period sum.  Every time the backend updates the invoice sum the
+    sensor re-anchors, avoiding drift.
     """
     if category_data is None or not isinstance(category_data, dict):
         return None
 
-    # Use the invoice period sum as the cumulative total
+    # --- base value: invoice period sum ---
     invoice_periods = category_data.get("invoicePeriods")
-    if isinstance(invoice_periods, list) and invoice_periods:
-        # Use the most recent (last) period
-        period = invoice_periods[-1]
-        total = period.get("sum")
-        if total is not None and isinstance(total, (int, float)):
-            # Convert water from m³ to Liters if the sum is in CubicMeter
-            # but the measurement unit is Liter
-            measurement_unit = category_data.get("measurementUnit", "")
-            sum_unit = period.get("sumUnit", "")
-            if measurement_unit == "Liter" and sum_unit == "CubicMeter":
-                return float(total) * 1000.0
-            return float(total)
+    if not isinstance(invoice_periods, list) or not invoice_periods:
+        return None
 
-    return None
+    period = invoice_periods[-1]
+    total = period.get("sum")
+    if total is None or not isinstance(total, (int, float)):
+        return None
+
+    base_value = float(total)
+
+    # Detect whether we need to convert units (water m³ -> L)
+    measurement_unit = category_data.get("measurementUnit", "")
+    sum_unit = period.get("sumUnit", "")
+    needs_water_conversion = (
+        measurement_unit == "Liter" and sum_unit == "CubicMeter"
+    )
+
+    if needs_water_conversion:
+        base_value *= 1000.0
+
+    # --- fine-grained adjustment from currentPeriodValues ---
+    if last_sum_changed is None:
+        # No anchor timestamp available (first poll) — return base only.
+        return base_value
+
+    current_values = category_data.get("currentPeriodValues")
+    if not isinstance(current_values, list) or not current_values:
+        return base_value
+
+    # Sum interval values whose date is strictly after the anchor timestamp.
+    # Both timestamps are naive-local ISO strings so lexicographic comparison
+    # works correctly.
+    adjustment = 0.0
+    for point in current_values:
+        point_date = point.get("date", "")
+        if point_date > last_sum_changed:
+            val = point.get("value")
+            if isinstance(val, (int, float)):
+                adjustment += val
+
+    if adjustment > 0:
+        _LOGGER.debug(
+            "Fine-grained adjustment: base=%.4f + adjustment=%.6f "
+            "(anchor=%s, %d values after anchor)",
+            base_value,
+            adjustment,
+            last_sum_changed,
+            sum(
+                1 for p in current_values if p.get("date", "") > last_sum_changed
+            ),
+        )
+
+    return base_value + adjustment
 
 
 class NeoVacSensor(CoordinatorEntity[NeoVacCoordinator], SensorEntity):
@@ -219,7 +267,8 @@ class NeoVacSensor(CoordinatorEntity[NeoVacCoordinator], SensorEntity):
     def native_value(self) -> float | None:
         """Return the current sensor value.
 
-        Returns the invoice period cumulative total.
+        Returns the invoice period cumulative total, adjusted upward with
+        fine-grained interval values received since the last sum update.
         """
         if not self.coordinator.data:
             return None
@@ -230,7 +279,15 @@ class NeoVacSensor(CoordinatorEntity[NeoVacCoordinator], SensorEntity):
         if category_data is None:
             return None
 
-        value = _extract_period_total(category_data)
+        # Get the timestamp of when we last observed a sum change for this
+        # category.  Used to decide which currentPeriodValues to add on top.
+        last_sum_changed = (
+            self.coordinator.data.get("last_sum_changed", {}).get(
+                self.entity_description.category
+            )
+        )
+
+        value = _extract_period_total(category_data, last_sum_changed)
 
         if value is not None:
             _LOGGER.debug(
@@ -287,6 +344,36 @@ class NeoVacSensor(CoordinatorEntity[NeoVacCoordinator], SensorEntity):
             period = invoice_periods[-1]
             attrs["invoice_period_start"] = period.get("startDate")
             attrs["invoice_period_end"] = period.get("endDate")
+            attrs["invoice_period_sum"] = period.get("sum")
+
+        # Add fine-grained adjustment info
+        last_sum_changed = (
+            self.coordinator.data.get("last_sum_changed", {}).get(
+                self.entity_description.category
+            )
+        )
+        if last_sum_changed:
+            attrs["last_sum_updated"] = last_sum_changed
+
+            # Count how many interval values are contributing to the
+            # adjustment so the user can see the adjustment breakdown.
+            current_values = category_data.get("currentPeriodValues")
+            if isinstance(current_values, list):
+                adjustment_values = [
+                    p
+                    for p in current_values
+                    if p.get("date", "") > last_sum_changed
+                ]
+                if adjustment_values:
+                    attrs["adjustment_count"] = len(adjustment_values)
+                    attrs["adjustment_total"] = round(
+                        sum(
+                            p.get("value", 0)
+                            for p in adjustment_values
+                            if isinstance(p.get("value"), (int, float))
+                        ),
+                        6,
+                    )
 
         return attrs if attrs else None
 

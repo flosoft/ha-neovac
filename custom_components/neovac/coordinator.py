@@ -47,7 +47,15 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "Water": { ... },
         },
         "available_categories": ["Electricity", "Water", ...],
+        "last_sum_changed": {
+            "Electricity": "2026-04-05T10:15:00",  # when sum last changed
+            ...
+        },
     }
+
+    The ``currentPeriodValues`` are always refreshed on every poll (even
+    when the invoice period sum has not changed) so that sensors can use
+    them to provide fine-grained adjustments between coarser sum updates.
     """
 
     config_entry: ConfigEntry
@@ -62,6 +70,12 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.client = client
         self.unit_id: str = str(entry.data[CONF_USAGE_UNIT_ID])
         self._available_categories: list[str] | None = None
+
+        # Track when invoicePeriods[-1].sum last changed per category.
+        # Stored as naive-local ISO timestamps (matching currentPeriodValues
+        # date format). Used so sensors can add fine-grained interval values
+        # on top of the coarser invoice period sum.
+        self._last_sum_changed: dict[str, str] = {}
 
         scan_interval = entry.options.get(
             CONF_SCAN_INTERVAL,
@@ -173,31 +187,44 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         previous_categories.get(category)
                     )
 
-                    if (
-                        old_total is not None
-                        and new_total is not None
-                        and new_total == old_total
-                    ):
-                        # Total unchanged — no new measurement arrived.
-                        # Keep previous data so HA does not record a new
-                        # state entry.
-                        result["categories"][category] = (
-                            previous_categories[category]
+                    sum_changed = (
+                        old_total is None
+                        or new_total is None
+                        or new_total != old_total
+                    )
+
+                    if sum_changed:
+                        # Invoice period sum changed — record when we
+                        # observed this new value (naive-local, matching
+                        # the format of currentPeriodValues[].date).
+                        self._last_sum_changed[category] = (
+                            now.replace(microsecond=0).isoformat()
                         )
-                        _LOGGER.debug(
-                            "Consumption total for %s unchanged (%.4f), "
-                            "skipping update",
-                            category,
-                            new_total,
-                        )
-                    else:
                         result["categories"][category] = data
                         _LOGGER.debug(
-                            "Consumption data for %s updated: "
-                            "%.4f -> %.4f (%d values)",
+                            "Consumption total for %s updated: "
+                            "%.4f -> %.4f (%d values), "
+                            "sum anchor timestamp: %s",
                             category,
                             old_total if old_total is not None else 0,
                             new_total if new_total is not None else 0,
+                            len(data.get("currentPeriodValues", [])),
+                            self._last_sum_changed[category],
+                        )
+                    else:
+                        # Sum unchanged. Keep the previous invoice period
+                        # data but update currentPeriodValues so sensors
+                        # can use them for fine-grained adjustments.
+                        merged = dict(previous_categories[category])
+                        merged["currentPeriodValues"] = data.get(
+                            "currentPeriodValues", []
+                        )
+                        result["categories"][category] = merged
+                        _LOGGER.debug(
+                            "Consumption total for %s unchanged (%.4f), "
+                            "updated %d interval values",
+                            category,
+                            new_total,
                             len(data.get("currentPeriodValues", [])),
                         )
             except Exception as err:
@@ -206,6 +233,9 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     category,
                     err,
                 )
+
+        # Expose the sum-changed timestamps so sensors can access them.
+        result["last_sum_changed"] = dict(self._last_sum_changed)
 
         return result
 
