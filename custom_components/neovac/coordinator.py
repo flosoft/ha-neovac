@@ -53,10 +53,6 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ...
         },
     }
-
-    The ``currentPeriodValues`` are always refreshed on every poll (even
-    when the invoice period sum has not changed) so that sensors can use
-    them to provide fine-grained adjustments between coarser sum updates.
     """
 
     config_entry: ConfigEntry
@@ -74,9 +70,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.debug_logging: bool = entry.options.get(CONF_DEBUG_LOGGING, False)
 
         # Track when invoicePeriods[-1].sum last changed per category.
-        # Stored as naive-local ISO timestamps (matching currentPeriodValues
-        # date format). Used so sensors can add fine-grained interval values
-        # on top of the coarser invoice period sum.
+        # Stored as naive-local ISO timestamps for debugging visibility.
         self._last_sum_changed: dict[str, str] = {}
 
         scan_interval = entry.options.get(
@@ -234,30 +228,24 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 self._last_sum_changed[category],
                             )
                     else:
-                        # Sum unchanged. Keep the previous invoice period
-                        # data but update currentPeriodValues so sensors
-                        # can use them for fine-grained adjustments.
-                        merged = dict(previous_categories[category])
-                        merged["currentPeriodValues"] = data.get(
-                            "currentPeriodValues", []
+                        # Total unchanged — keep previous data so HA does
+                        # not record a new state entry.
+                        result["categories"][category] = (
+                            previous_categories[category]
                         )
-                        result["categories"][category] = merged
                         _LOGGER.debug(
                             "Consumption total for %s unchanged (%.4f), "
-                            "updated %d interval values",
+                            "skipping update",
                             category,
                             new_total,
-                            len(data.get("currentPeriodValues", [])),
                         )
                         if self.debug_logging:
                             _LOGGER.warning(
                                 "[NeoVac debug] %s: invoice period sum "
                                 "UNCHANGED at %.4f | "
-                                "updated %d interval values | "
                                 "anchor timestamp: %s",
                                 category,
                                 new_total,
-                                len(data.get("currentPeriodValues", [])),
                                 self._last_sum_changed.get(category, "N/A"),
                             )
             except Exception as err:
