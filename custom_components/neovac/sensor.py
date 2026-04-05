@@ -182,7 +182,7 @@ def _extract_period_total(
 
     if category_data is None or not isinstance(category_data, dict):
         if debug_logging:
-            _LOGGER.info(
+            _LOGGER.warning(
                 "[NeoVac debug] %s: no category data available, returning None",
                 label,
             )
@@ -192,7 +192,7 @@ def _extract_period_total(
     invoice_periods = category_data.get("invoicePeriods")
     if not isinstance(invoice_periods, list) or not invoice_periods:
         if debug_logging:
-            _LOGGER.info(
+            _LOGGER.warning(
                 "[NeoVac debug] %s: no invoice periods in data, returning None",
                 label,
             )
@@ -202,7 +202,7 @@ def _extract_period_total(
     total = period.get("sum")
     if total is None or not isinstance(total, (int, float)):
         if debug_logging:
-            _LOGGER.info(
+            _LOGGER.warning(
                 "[NeoVac debug] %s: invoice period sum is missing or invalid "
                 "(value=%r), returning None",
                 label,
@@ -221,7 +221,7 @@ def _extract_period_total(
 
     if needs_water_conversion:
         if debug_logging:
-            _LOGGER.info(
+            _LOGGER.warning(
                 "[NeoVac debug] %s: converting water unit m3 -> L: "
                 "%.4f m3 -> %.1f L",
                 label,
@@ -234,7 +234,7 @@ def _extract_period_total(
     if last_sum_changed is None:
         # No anchor timestamp available (first poll) — return base only.
         if debug_logging:
-            _LOGGER.info(
+            _LOGGER.warning(
                 "[NeoVac debug] %s: no anchor timestamp (first poll), "
                 "returning base value only: %.4f",
                 label,
@@ -245,7 +245,7 @@ def _extract_period_total(
     current_values = category_data.get("currentPeriodValues")
     if not isinstance(current_values, list) or not current_values:
         if debug_logging:
-            _LOGGER.info(
+            _LOGGER.warning(
                 "[NeoVac debug] %s: no currentPeriodValues, "
                 "returning base value only: %.4f",
                 label,
@@ -277,7 +277,7 @@ def _extract_period_total(
         )
 
     if debug_logging:
-        _LOGGER.info(
+        _LOGGER.warning(
             "[NeoVac debug] %s: base=%.4f + adjustment=%.6f "
             "(%d of %d interval values after anchor %s) = %.4f",
             label,

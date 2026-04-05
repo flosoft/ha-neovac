@@ -95,7 +95,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the NeoVac API."""
         if self.debug_logging:
-            _LOGGER.info("[NeoVac debug] Starting data update for unit %s", self.unit_id)
+            _LOGGER.warning("[NeoVac debug] Starting data update for unit %s", self.unit_id)
         try:
             return await self._fetch_all_data()
         except NeoVacAuthError as err:
@@ -153,7 +153,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._available_categories,
             )
             if self.debug_logging:
-                _LOGGER.info(
+                _LOGGER.warning(
                     "[NeoVac debug] Discovered %d categories: %s",
                     len(self._available_categories),
                     ", ".join(self._available_categories),
@@ -222,7 +222,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             self._last_sum_changed[category],
                         )
                         if self.debug_logging:
-                            _LOGGER.info(
+                            _LOGGER.warning(
                                 "[NeoVac debug] %s: invoice period sum "
                                 "CHANGED %.4f -> %.4f | "
                                 "received %d interval values | "
@@ -250,7 +250,7 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             len(data.get("currentPeriodValues", [])),
                         )
                         if self.debug_logging:
-                            _LOGGER.info(
+                            _LOGGER.warning(
                                 "[NeoVac debug] %s: invoice period sum "
                                 "UNCHANGED at %.4f | "
                                 "updated %d interval values | "
