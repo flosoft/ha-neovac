@@ -93,6 +93,22 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"Error fetching data: {err}"
             ) from err
 
+    @staticmethod
+    def _get_period_total(category_data: dict[str, Any] | None) -> float | None:
+        """Extract the invoice period total from category data.
+
+        Returns the sum from the most recent invoice period, or None if
+        the data is missing or malformed.
+        """
+        if not isinstance(category_data, dict):
+            return None
+        invoice_periods = category_data.get("invoicePeriods")
+        if isinstance(invoice_periods, list) and invoice_periods:
+            total = invoice_periods[-1].get("sum")
+            if isinstance(total, (int, float)):
+                return float(total)
+        return None
+
     async def _fetch_all_data(self) -> dict[str, Any]:
         """Fetch all data from the API."""
         result: dict[str, Any] = {
@@ -121,6 +137,11 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         result["available_categories"] = self._available_categories
 
+        # Previous data for change detection
+        previous_categories: dict[str, Any] = {}
+        if self.data and isinstance(self.data.get("categories"), dict):
+            previous_categories = self.data["categories"]
+
         # Time window: last 24 hours
         now = datetime.now()
         end_date = now.strftime("%Y-%m-%d %H:%M")
@@ -147,12 +168,38 @@ class NeoVacCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     end_date=end_date,
                 )
                 if data is not None:
-                    result["categories"][category] = data
-                    _LOGGER.debug(
-                        "Got consumption data for %s: %d values",
-                        category,
-                        len(data.get("currentPeriodValues", [])),
+                    new_total = self._get_period_total(data)
+                    old_total = self._get_period_total(
+                        previous_categories.get(category)
                     )
+
+                    if (
+                        old_total is not None
+                        and new_total is not None
+                        and new_total == old_total
+                    ):
+                        # Total unchanged — no new measurement arrived.
+                        # Keep previous data so HA does not record a new
+                        # state entry.
+                        result["categories"][category] = (
+                            previous_categories[category]
+                        )
+                        _LOGGER.debug(
+                            "Consumption total for %s unchanged (%.4f), "
+                            "skipping update",
+                            category,
+                            new_total,
+                        )
+                    else:
+                        result["categories"][category] = data
+                        _LOGGER.debug(
+                            "Consumption data for %s updated: "
+                            "%.4f -> %.4f (%d values)",
+                            category,
+                            old_total if old_total is not None else 0,
+                            new_total if new_total is not None else 0,
+                            len(data.get("currentPeriodValues", [])),
+                        )
             except Exception as err:
                 _LOGGER.warning(
                     "Failed to fetch consumption for %s: %s",
